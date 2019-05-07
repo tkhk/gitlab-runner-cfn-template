@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description:
+  GitLab Runner
+
+Parameters:
+  RunnerToken:
+    Description: ""
+    Type: String
+  VPCID:
+    Description: ""
+    Type: "AWS::EC2::VPC::Id"
+  SubnetID:
+    Description: ""
+    Type: "AWS::EC2::Subnet::Id"
+  RunnerTags:
+    Description: ""
+    Type: String
+  ImageID:
+    Description: ""
+    Type: String
+    Default: "ami-097beac0bacfefe65"
+  InstanceType:
+    Description: ""
+    Type: String
+    Default: "t2.small"
+    AllowedValues:
+      - "t2.small"
+      - "t2.medium"
+  CacheS3Bucket:
+    Description: ""
+    Type: String
+  KeyPair:
+    Description: ""
+    Type: "AWS::EC2::KeyPair::KeyName"
+  InstanceNum:
+    Description: ""
+    Type: Number
+    MaxValue: 5
+    MinValue: 0
+    Default: 1
+
+Outputs:
+  LatestVersion:
+    Value: !GetAtt LaunchTemplate.LatestVersionNumber
+
+Resources:
+  IAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "GitLab-Runner"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+
+  IAMProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref IAMRole
+
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "GitLab Runner Bastion"
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: GitLab-Runner
+      LaunchTemplateData:
+        ImageId: !Ref ImageID
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPair
+        SecurityGroupIds:
+          - !GetAtt SecurityGroup.GroupId
+        IamInstanceProfile:
+          Arn: !GetAtt IAMProfile.Arn
+        BlockDeviceMappings:
+          - DeviceName: "/dev/sda1"
+            Ebs:
+              DeleteOnTermination: true
+              VolumeType: "gp2"
+              VolumeSize: 30
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: GitLab_Runner
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/sh
+            apt update
+
+            # Install cfn-signal
+            apt update install heat-cfntools
+
+            # Install gitlab-runner
+            apt install curl
+            curl -L https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh | bash
+            apt install -y gitlab-runner
+
+            # Install docker
+            # https://docs.docker.com/install/linux/docker-ce/ubuntu/
+            apt install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+            add-apt-repository \
+              "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) \
+              stable"
+            apt update
+            apt install -y docker-ce docker-ce-cli containerd.io
+
+            # Config
+            gitlab-runner register \
+              --non-interactive \
+            	--executor=docker \
+            	--registration-token=${RunnerToken} \
+            	--name=gitlab-runner \
+            	--url=https://gitlab.com/ \
+            	--tag-list=${RunnerTags} \
+              --run-untagged=true \
+            	--docker-image=ubuntu:16.04 \
+            	--docker-tlsverify=false \
+            	--docker-privileged=false \
+            	--docker-disable-entrypoint-overwrite=false \
+            	--docker-oom-kill-disable=false \
+            	--docker-disable-cache=false \
+            	--docker-volumes=/cache \
+            	--docker-shm-size=0 \
+            	--cache-type=s3 \
+            	--cache-shared=true \
+              --cache-s3-bucket-location=${AWS::Region} \
+            	--cache-s3-bucket-name=${CacheS3Bucket} \
+            	--cache-path=gitlab-runner-cache
+            chmod 644 /etc/gitlab-runner/config.toml
+
+            # cfn-signal
+            cfn-signal --stack ${AWS::StackName} --region ${AWS::Region} --resource AutoScalingGroup
+
+
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: 'true'
+    CreationPolicy:
+      AutoScalingCreationPolicy:
+        MinSuccessfulInstancesPercent: 0
+      ResourceSignal:
+        Count: 1
+        Timeout: PT5M
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SubnetID
+      HealthCheckType: EC2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      DesiredCapacity: !Ref InstanceNum
+      MaxSize: 5
+      MinSize: 0
